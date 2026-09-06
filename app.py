@@ -29,6 +29,7 @@ from analytics import (
 )
 from backtest import full_backtest_report
 from overfitting import full_overfitting_report
+from rnd import full_rnd_pipeline, synthetic_rnd_pipeline
 
 # ── Config ────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="QuantPort", page_icon="📈",
@@ -166,10 +167,10 @@ PORT_WEIGHTS = [w_ms, w_mv, w_so, w_eq]
 PORT_COLORS  = ["#f59e0b","#10b981","#a78bfa","#60a5fa"]
 
 # ── TABS ──────────────────────────────────────────────────────────────────────
-tab1,tab2,tab3,tab4,tab5,tab6,tab7,tab8 = st.tabs([
+tab1,tab2,tab3,tab4,tab5,tab6,tab7,tab8,tab9 = st.tabs([
     "🎯 Optimization","⚠️ Risk Analytics","📉 Drawdown",
     "🔄 Rolling Metrics","💸 Rebalancing","🧪 VaR Backtest",
-    "🔥 Stress Test","🎰 Overfitting"
+    "🔥 Stress Test","🎰 Overfitting","📐 Risk-Neutral Density"
 ])
 
 # ════════════════════════════════════════════════════════════════
@@ -943,6 +944,273 @@ To be 95% confident this SR is real with **live trading**, you need at least **{
 
 *Reference: Bailey & López de Prado (2014), "The Deflated Sharpe Ratio", Journal of Portfolio Management*
     """)
+
+# ════════════════════════════════════════════════════════════════
+# TAB 9 — BREEDEN-LITZENBERGER RISK-NEUTRAL DENSITY
+# ════════════════════════════════════════════════════════════════
+with tab9:
+    st.markdown('<div class="section-header">Implied Risk-Neutral Distribution — Breeden-Litzenberger (1978)</div>',
+                unsafe_allow_html=True)
+
+    st.markdown("""
+    **Core Insight:** Option prices secretly encode the market's *true* probability
+    distribution of future prices — not the Gaussian assumption of Black-Scholes.
+
+    **Breeden & Litzenberger (1978)** showed that the risk-neutral density is simply
+    the second derivative of the call price with respect to strike:
+
+    > **q(K) = e^(rT) · d²C/dK²**
+
+    The key engineering challenge: second derivatives amplify noise, so we smooth
+    in implied-volatility space before differentiating — otherwise we get negative probabilities.
+
+    **Why this matters for VaR:** Your parametric VaR (Tab 2) assumes normality.
+    This tab shows exactly how wrong that assumption is — and by how much it underestimates tail risk.
+    """)
+
+    st.divider()
+
+    # Controls
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        rnd_ticker = st.selectbox("Ticker", ["SPY","AAPL","MSFT","GOOGL","JPM","GLD","QQQ"], index=0)
+    with c2:
+        expiry_idx = st.slider("Expiry (0=nearest)", 0, 5, 2,
+                               help="0=nearest expiry, higher=further out")
+    with c3:
+        use_synthetic = st.checkbox("Use synthetic data (demo mode)",
+                                    value=False,
+                                    help="Use if market closed or no options data")
+
+    # Synthetic controls (only shown in demo mode)
+    if use_synthetic:
+        sc1, sc2, sc3 = st.columns(3)
+        with sc1:
+            syn_spot = st.number_input("Spot Price ($)", value=500.0, step=10.0)
+        with sc2:
+            syn_atm_vol = st.slider("ATM Implied Vol (%)", 5, 60, 18) / 100
+        with sc3:
+            syn_skew = st.slider("Vol Skew (negative=fear)", -1.0, 0.5, -0.35, 0.05)
+
+    run_rnd = st.button("📐 Extract Risk-Neutral Distribution",
+                        type="primary", key="rnd_btn")
+
+    if not run_rnd:
+        st.info("👆 Click **Extract Risk-Neutral Distribution** to run the analysis.")
+        st.markdown("""
+        **What you'll see:**
+        - The market's implied probability distribution extracted from real option prices
+        - Comparison to Black-Scholes Gaussian assumption
+        - The volatility smile that drives the skew
+        - Tail probability comparison: what the market really thinks vs what BS assumes
+        """)
+    else:
+        with st.spinner(f"Fetching {rnd_ticker} options and extracting risk-neutral density..."):
+            try:
+                if use_synthetic:
+                    result = synthetic_rnd_pipeline(
+                        rnd_ticker, S=syn_spot,
+                        atm_vol=syn_atm_vol, skew=syn_skew
+                    )
+                    st.warning("⚠️ Using synthetic data for demonstration.")
+                else:
+                    try:
+                        result = full_rnd_pipeline(rnd_ticker, expiry_idx)
+                    except Exception as e:
+                        st.warning(f"Live options unavailable ({e}). Falling back to synthetic data.")
+                        result = synthetic_rnd_pipeline(rnd_ticker)
+            except Exception as e:
+                st.error(f"Error: {e}")
+                st.stop()
+
+        S       = result["spot"]
+        stats   = result["rnd_stats"]
+        bs_st   = result["bs_stats"]
+        is_syn  = result.get("is_synthetic", False)
+
+        # ── KPI Row ───────────────────────────────────────────
+        st.markdown(f"### {rnd_ticker} — Expiry: {result['expiry']} | "
+                    f"Spot: ${S:.2f} | ATM IV: {result['atm_iv']*100:.1f}% | "
+                    f"T: {result['T']*365:.0f} days")
+
+        c1,c2,c3,c4,c5 = st.columns(5)
+        c1.metric("RND Mean",     f"${stats['rnd_mean']:.2f}",
+                  help="Risk-neutral expected future price")
+        c2.metric("RND Skewness", f"{stats['rnd_skewness']:.3f}",
+                  help="Negative = left tail = market fear of crash")
+        c3.metric("RND Kurtosis", f"{stats['rnd_kurtosis']:.3f}",
+                  help="Positive = fat tails vs normal distribution")
+        c4.metric("P(drop > 10%)", f"{stats['p_drop_10pct']:.2f}%",
+                  delta=f"BS: {bs_st['p_drop_10pct']:.2f}%",
+                  delta_color="inverse")
+        c5.metric("P(drop > 20%)", f"{stats['p_drop_20pct']:.2f}%",
+                  delta=f"BS: {bs_st['p_drop_20pct']:.2f}%",
+                  delta_color="inverse")
+
+        st.divider()
+
+        # ── Plot 1: Risk-Neutral Density vs Black-Scholes ─────
+        st.markdown("### 📊 Risk-Neutral Density vs Black-Scholes Gaussian")
+        st.caption("This is the market's TRUE implied distribution extracted from option prices — not the textbook assumption.")
+
+        fig, ax = dfig(figsize=(11, 5))
+
+        # RND
+        ax.plot(result["K_rnd"], result["rnd"],
+                color="#f59e0b", lw=2.5, label="Market RND (Breeden-Litzenberger)")
+        ax.fill_between(result["K_rnd"], result["rnd"],
+                        alpha=0.2, color="#f59e0b")
+
+        # BS Gaussian
+        ax.plot(result["K_rnd"], result["bs_density"],
+                color="#60a5fa", lw=2, linestyle="--",
+                label=f"Black-Scholes Gaussian (ATM IV={result['atm_iv']*100:.1f}%)")
+        ax.fill_between(result["K_rnd"], result["bs_density"],
+                        alpha=0.1, color="#60a5fa")
+
+        # Spot price line
+        ax.axvline(S, color="white", lw=1.2, linestyle=":",
+                   label=f"Current spot = ${S:.0f}")
+
+        # Shade left tail difference
+        K_arr  = result["K_rnd"]
+        rnd_arr = result["rnd"]
+        bs_arr  = result["bs_density"]
+        mask_tail = K_arr < 0.90 * S
+        ax.fill_between(K_arr[mask_tail],
+                        rnd_arr[mask_tail], bs_arr[mask_tail],
+                        where=rnd_arr[mask_tail] > bs_arr[mask_tail],
+                        alpha=0.4, color="#ef4444",
+                        label="Extra tail risk vs BS")
+
+        ax.set_xlabel("Strike Price ($)", color="white")
+        ax.set_ylabel("Probability Density", color="white")
+        ax.set_title(
+            f"{rnd_ticker} Risk-Neutral Density — Market implies "
+            f"{'left-skewed' if stats['rnd_skewness'] < 0 else 'right-skewed'} "
+            f"fat-tailed distribution",
+            color="white", fontsize=12, fontweight="bold"
+        )
+        ax.legend(facecolor="#1e1e2e", labelcolor="white", fontsize=9)
+        ax.grid(True, alpha=0.13)
+        st.pyplot(fig); plt.close()
+
+        # ── Plot 2: Volatility Smile ───────────────────────────
+        st.markdown("### 📈 Implied Volatility Smile")
+        st.caption("The non-flat IV smile is what drives the non-Gaussian distribution. "
+                   "Put options (low strikes) are expensive because the market fears crashes.")
+
+        fig, ax = dfig(figsize=(11, 4))
+        ax.scatter(result["K_raw"], result["iv_raw"] * 100,
+                   color="#ef4444", s=30, alpha=0.7, zorder=5,
+                   label="Market IV (raw)")
+        ax.plot(result["K_smooth"], result["iv_smooth"] * 100,
+                color="#10b981", lw=2.5, label="Smoothed IV (spline)")
+        ax.axvline(S, color="white", lw=1, linestyle=":",
+                   label=f"ATM = ${S:.0f}")
+
+        ax.set_xlabel("Strike Price ($)", color="white")
+        ax.set_ylabel("Implied Volatility (%)", color="white")
+        ax.set_title("Implied Volatility Smile — Put Skew Shows Market Fear",
+                     color="white", fontsize=12, fontweight="bold")
+        ax.legend(facecolor="#1e1e2e", labelcolor="white", fontsize=9)
+        ax.grid(True, alpha=0.13)
+        st.pyplot(fig); plt.close()
+
+        # ── Plot 3: Tail Probability Comparison ───────────────
+        st.markdown("### ⚠️ Tail Probability: Market vs Black-Scholes")
+        st.caption("This is why Gaussian VaR underestimates real risk.")
+
+        scenarios  = ["P(drop > 5%)", "P(drop > 10%)", "P(drop > 20%)", "P(rally > 10%)"]
+        thresholds = [0.95, 0.90, 0.80, 1.10]
+        directions = ["below", "below", "below", "above"]
+
+        rnd_probs = []
+        bs_probs  = []
+        K_arr     = result["K_rnd"]
+        rnd_arr   = result["rnd"]
+        bs_arr    = result["bs_density"]
+
+        for thresh, direction in zip(thresholds, directions):
+            if direction == "below":
+                mask = K_arr < thresh * S
+            else:
+                mask = K_arr > thresh * S
+
+            if mask.any():
+                rnd_probs.append(float(np.trapezoid(rnd_arr[mask], K_arr[mask]) * 100))
+                bs_probs.append(float(np.trapezoid(bs_arr[mask], K_arr[mask]) * 100))
+            else:
+                rnd_probs.append(0.0)
+                bs_probs.append(0.0)
+
+        x     = np.arange(len(scenarios))
+        width = 0.35
+        fig, ax = dfig(figsize=(10, 4))
+        b1 = ax.bar(x - width/2, rnd_probs, width, color="#f59e0b",
+                    alpha=0.85, label="Market RND")
+        b2 = ax.bar(x + width/2, bs_probs,  width, color="#60a5fa",
+                    alpha=0.85, label="Black-Scholes")
+
+        ax.bar_label(b1, fmt="%.2f%%", padding=3,
+                     color="white", fontsize=8)
+        ax.bar_label(b2, fmt="%.2f%%", padding=3,
+                     color="white", fontsize=8)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(scenarios, color="white")
+        ax.set_ylabel("Probability (%)", color="white")
+        ax.set_title("Tail Probabilities: Market RND vs Black-Scholes Gaussian",
+                     color="white", fontsize=12, fontweight="bold")
+        ax.legend(facecolor="#1e1e2e", labelcolor="white", fontsize=10)
+        ax.grid(True, alpha=0.13, axis="y")
+        st.pyplot(fig); plt.close()
+
+        # ── Summary comparison table ───────────────────────────
+        st.divider()
+        st.markdown("### 📋 Distribution Statistics Comparison")
+        comp_df = pd.DataFrame({
+            "Metric":             ["Mean ($)", "Std Dev ($)", "Skewness",
+                                   "Excess Kurtosis", "P(drop>10%)",
+                                   "P(drop>20%)", "P(rally>10%)"],
+            "Market RND":         [f"${stats['rnd_mean']:.2f}",
+                                   f"${stats['rnd_std']:.2f}",
+                                   f"{stats['rnd_skewness']:.4f}",
+                                   f"{stats['rnd_kurtosis']:.4f}",
+                                   f"{stats['p_drop_10pct']:.2f}%",
+                                   f"{stats['p_drop_20pct']:.2f}%",
+                                   f"{stats['p_rally_10pct']:.2f}%"],
+            "Black-Scholes":      [f"${bs_st['rnd_mean']:.2f}",
+                                   f"${bs_st['rnd_std']:.2f}",
+                                   f"{bs_st['rnd_skewness']:.4f}",
+                                   f"{bs_st['rnd_kurtosis']:.4f}",
+                                   f"{bs_st['p_drop_10pct']:.2f}%",
+                                   f"{bs_st['p_drop_20pct']:.2f}%",
+                                   f"{bs_st['p_rally_10pct']:.2f}%"],
+        }).set_index("Metric")
+        st.dataframe(comp_df, width="stretch")
+
+        # ── Interpretation ─────────────────────────────────────
+        st.divider()
+        skew_sign  = "negative" if stats["rnd_skewness"] < 0 else "positive"
+        tail_extra = stats["p_drop_10pct"] - bs_st["p_drop_10pct"]
+
+        st.info(f"""
+**Key Finding for {rnd_ticker}:**
+
+The market-implied distribution has **{skew_sign} skewness ({stats['rnd_skewness']:.3f})** and
+**excess kurtosis of {stats['rnd_kurtosis']:.3f}** — confirming fat tails that Black-Scholes ignores.
+
+The probability of a **>10% drop** is **{stats['p_drop_10pct']:.2f}%** under the market RND
+vs only **{bs_st['p_drop_10pct']:.2f}%** under Black-Scholes — a difference of **{tail_extra:+.2f}%**.
+
+This directly explains why **Parametric VaR (Tab 2) underestimates tail risk** compared to
+Historical VaR — the Gaussian assumption misses the left tail that option markets price in.
+
+**This is why desks use Historical VaR or Cornish-Fisher VaR over Parametric VaR.**
+
+*Reference: Breeden & Litzenberger (1978), "Prices of State-Contingent Claims Implicit in Option Prices", Journal of Business 51(4)*
+        """)
 
 st.divider()
 st.caption("**QuantPort v3** | Abhishek Kumar Ojha | IIT Kharagpur | 22CY23003 "
